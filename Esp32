@@ -1,28 +1,31 @@
 #include <M5Stack.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
+#include <TinyGSM.h>
+#include <ArduinoHttpClient.h>
 #include <ArduinoJson.h>
 
-// WiFi credentials
-const char* ssid = "karis";
-const char* password = "password";
+const char* apn = "Saf-apn";
+const char* gprsUser = "safaricom";
+const char* gprsPass = "saf";
 
-// Raspberry Pi server address (replace with your Pi's IP address)
-const char* serverUrl = "http://192.168.1.100:5000/data";
+const char* serverUrl = "http://your-server.com:5000/data";
+const int serverPort = 5000;
 
-// Pin definitions
-const int FLOW_SENSOR_PIN = 35;  // Analog input pin for flow sensor
+const int FLOW_SENSOR_PIN = 35;
+#define RX_PIN 16
+#define TX_PIN 17
 
-// Variables for water measurement
 float totalVolume = 0.0;    
 float flowRate = 0.0;       
 float monthlyCost = 0.0;    
 int valveOpenPercent = 100; 
 
-// Variables for connection status
-bool isWifiConnected = false;
+bool isGsmConnected = false;
 unsigned long lastSendTime = 0;
-const unsigned long sendInterval = 5000; // Send every 5 seconds
+const unsigned long sendInterval = 5000;
+
+TinyGsm modem(Serial2);
+TinyGsmClient client(modem);
+HttpClient http(client, serverUrl, serverPort);
 
 void drawValveBar(int percent) {
     int barWidth = 140;
@@ -30,27 +33,18 @@ void drawValveBar(int percent) {
     int startX = 170;
     int startY = 210;
     
-    // Draw empty bar outline
     M5.Lcd.drawRect(startX, startY, barWidth, barHeight, WHITE);
-    
-    // Calculate filled width based on percentage
     int fillWidth = (percent * (barWidth - 2)) / 100;
-    
-    // Clear previous fill
     M5.Lcd.fillRect(startX + 1, startY + 1, barWidth - 2, barHeight - 2, BLACK);
-    
-    // Draw new fill
     M5.Lcd.fillRect(startX + 1, startY + 1, fillWidth, barHeight - 2, ORANGE);
 }
 
 void updateDisplay() {
-    // Clear display areas
     M5.Lcd.fillRect(0,30,164,104,BLACK);
     M5.Lcd.fillRect(166,30,164,104,BLACK);
     M5.Lcd.fillRect(0,136,164,104,BLACK);
     M5.Lcd.fillRect(166,136,164,104,BLACK);
     
-    // First quadrant - Volume
     M5.Lcd.setCursor(5, 40);
     M5.Lcd.setTextColor(RED);
     M5.Lcd.setTextSize(3);
@@ -63,7 +57,6 @@ void updateDisplay() {
     M5.Lcd.setTextSize(3);
     M5.Lcd.println("L");
     
-    // Second quadrant - Flow Rate
     M5.Lcd.setCursor(170,40);
     M5.Lcd.setTextColor(YELLOW);
     M5.Lcd.setTextSize(3);
@@ -76,7 +69,6 @@ void updateDisplay() {
     M5.Lcd.setTextSize(3);
     M5.Lcd.println("L/m");
     
-    // Third quadrant - Cost
     M5.Lcd.setCursor(5,137);
     M5.Lcd.setTextColor(BLUE);
     M5.Lcd.setTextSize(3);
@@ -89,7 +81,6 @@ void updateDisplay() {
     M5.Lcd.setTextSize(3);
     M5.Lcd.println("$");
     
-    // Fourth quadrant - Valve
     M5.Lcd.setCursor(170,137);
     M5.Lcd.setTextColor(ORANGE);
     M5.Lcd.setTextSize(3);
@@ -102,108 +93,101 @@ void updateDisplay() {
     M5.Lcd.setTextSize(3);
     M5.Lcd.println("%");
     
-    // Draw valve position bar
     drawValveBar(valveOpenPercent);
 }
 
-void setupWiFi() {
-    WiFi.begin(ssid, password);
+void setupGSM() {
+    Serial2.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
+    
     M5.Lcd.setCursor(0, 0);
-    M5.Lcd.print("Connecting to WiFi");
+    M5.Lcd.print("Initializing GSM...");
     
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-        delay(500);
-        M5.Lcd.print(".");
-        attempts++;
+    if (!modem.restart()) {
+        M5.Lcd.println("GSM Init Failed!");
+        return;
     }
     
-    if (WiFi.status() == WL_CONNECTED) {
-        isWifiConnected = true;
-        M5.Lcd.println("\nConnected!");
-        M5.Lcd.println(WiFi.localIP().toString());
-    } else {
-        M5.Lcd.println("\nFailed to connect!");
+    M5.Lcd.print("Connecting to network...");
+    if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+        M5.Lcd.println("GPRS Connection Failed!");
+        return;
     }
+    
+    isGsmConnected = true;
+    M5.Lcd.println("\nConnected to GSM!");
     delay(2000);
 }
 
 void sendDataToPi() {
-    if (!isWifiConnected || WiFi.status() != WL_CONNECTED) {
+    if (!isGsmConnected) {
         return;
     }
 
-    // Create JSON document
     StaticJsonDocument<200> doc;
     doc["total_volume"] = totalVolume;
     doc["flow_rate"] = flowRate;
     doc["monthly_cost"] = monthlyCost;
     doc["valve_percent"] = valveOpenPercent;
 
-    // Serialize JSON to string
     String jsonString;
     serializeJson(doc, jsonString);
 
-    // Send HTTP POST request
-    HTTPClient http;
-    http.begin(serverUrl);
-    http.addHeader("Content-Type", "application/json");
+    http.beginRequest();
+    http.post("/data");
+    http.sendHeader("Content-Type", "application/json");
+    http.sendHeader("Content-Length", jsonString.length());
+    http.beginBody();
+    http.print(jsonString);
     
-    int httpResponseCode = http.POST(jsonString);
+    int httpResponseCode = http.responseStatusCode();
     
     if (httpResponseCode > 0) {
-        String response = http.getString();
-        // Small indicator for successful send
+        String response = http.responseBody();
+        StaticJsonDocument<200> respDoc;
+        deserializeJson(respDoc, response);
+        
+        if (respDoc.containsKey("set_valve")) {
+            valveOpenPercent = respDoc["set_valve"].as<int>();
+            valveOpenPercent = constrain(valveOpenPercent, 0, 100);
+        }
+        
         M5.Lcd.fillCircle(300, 15, 5, GREEN);
     } else {
-        // Indicator for failed send
         M5.Lcd.fillCircle(300, 15, 5, RED);
     }
-    
-    http.end();
 }
 
 void setup() {
     M5.begin();
     M5.Power.begin();
     
-    // Initialize analog pin
     pinMode(FLOW_SENSOR_PIN, INPUT);
     
-    // Initialize display
     M5.Lcd.fillScreen(BLACK);
     M5.Lcd.setCursor(90, 0);
     M5.Lcd.setTextColor(WHITE);
     M5.Lcd.setTextSize(3);
     M5.Lcd.println("WATER METER");
     
-    // Draw layout lines
     M5.Lcd.drawLine(0, 135, 360, 135, WHITE);
     M5.Lcd.drawLine(165, 30, 165, 240, WHITE);
     M5.Lcd.drawLine(0, 30, 360, 30, WHITE);
     
-    // Connect to WiFi
-    setupWiFi();
+    setupGSM();
 }
 
 void loop() {
-    // Read flow rate directly from analog pin 35
     flowRate = analogRead(FLOW_SENSOR_PIN);
     
-    // Map the flow rate to valve opening percentage (0-4095 maps to 0-100%)
     valveOpenPercent = map(flowRate, 0, 4095, 0, 100);
     valveOpenPercent = constrain(valveOpenPercent, 0, 100);
     
-    // Update total volume (assuming flowRate represents L/min)
     totalVolume += (flowRate / 60.0);
     
-    // Update monthly cost
     monthlyCost = totalVolume * 0.5;
     
-    // Update display
     updateDisplay();
     
-    // Send data to Raspberry Pi every 5 seconds
     unsigned long currentTime = millis();
     if (currentTime - lastSendTime >= sendInterval) {
         sendDataToPi();

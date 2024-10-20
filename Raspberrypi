@@ -1,0 +1,175 @@
+import serial
+import time
+import json
+from firebase_admin import credentials, initialize_app, db
+import threading
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+cred = credentials.Certificate('path/to/your/firebase-credentials.json')
+firebase_app = initialize_app(cred, {
+    'databaseURL': 'https://your-project-id.firebaseio.com'
+})
+
+GSM_PORT = '/dev/ttyUSB0'
+GSM_BAUDRATE = 115200
+FIREBASE_UPDATE_INTERVAL = 5
+
+current_flow_rate = 0
+current_valve_position = 100
+gsm_modem = None
+last_firebase_update = 0
+
+class GSMModem:
+    def __init__(self, port, baudrate):
+        self.serial = serial.Serial(port, baudrate, timeout=1)
+        self.sms_buffer = []
+        
+    def initialize(self):
+        commands = [
+            'AT',
+            'AT+CMGF=1',
+            'AT+CNMI=2,1,0,0,0',
+            'AT+CREG?',
+        ]
+        
+        for cmd in commands:
+            self.send_command(cmd)
+            time.sleep(1)
+    
+    def send_command(self, command):
+        self.serial.write(f"{command}\r\n".encode())
+        time.sleep(0.5)
+        response = self.serial.read_all().decode()
+        return response
+    
+    def send_sms(self, phone_number, message):
+        self.send_command(f'AT+CMGS="{phone_number}"')
+        self.serial.write(message.encode() + b'\x1A')
+        time.sleep(2)
+        return self.serial.read_all().decode()
+    
+    def read_sms(self):
+        response = self.send_command('AT+CMGL="ALL"')
+        return response
+    
+    def parse_data_message(self, message):
+        try:
+            return json.loads(message)
+        except json.JSONDecodeError:
+            return None
+
+def setup_gsm():
+    global gsm_modem
+    try:
+        gsm_modem = GSMModem(GSM_PORT, GSM_BAUDRATE)
+        gsm_modem.initialize()
+        print("GSM modem initialized successfully")
+        return True
+    except Exception as e:
+        print(f"Error initializing GSM modem: {e}")
+        return False
+
+def update_firebase(data):
+    try:
+        ref = db.reference('/water_meter/current')
+        ref.set(data)
+        
+        timestamp = int(time.time())
+        history_ref = db.reference(f'/water_meter/history/{timestamp}')
+        history_ref.set(data)
+        
+        print("Firebase updated successfully")
+    except Exception as e:
+        print(f"Error updating Firebase: {e}")
+
+def calculate_valve_position(flow_rate):
+    if flow_rate > 90:
+        return 80
+    elif flow_rate > 70:
+        return 90
+    elif flow_rate < 20:
+        return 100
+    return 95
+
+def gsm_monitoring_thread():
+    global current_flow_rate, current_valve_position
+    
+    while True:
+        try:
+            messages = gsm_modem.read_sms()
+            
+            for message in messages:
+                data = gsm_modem.parse_data_message(message)
+                if data and 'flow_rate' in data:
+                    current_flow_rate = data['flow_rate']
+                    
+                    new_valve_position = calculate_valve_position(current_flow_rate)
+                    
+                    if new_valve_position != current_valve_position:
+                        current_valve_position = new_valve_position
+                        response_data = {
+                            'valve_position': current_valve_position
+                        }
+                        gsm_modem.send_sms('ESP32_NUMBER', json.dumps(response_data))
+                    
+                    global last_firebase_update
+                    current_time = time.time()
+                    if current_time - last_firebase_update >= FIREBASE_UPDATE_INTERVAL:
+                        update_firebase({
+                            'flow_rate': current_flow_rate,
+                            'valve_position': current_valve_position,
+                            'timestamp': current_time
+                        })
+                        last_firebase_update = current_time
+            
+            time.sleep(1)
+        except Exception as e:
+            print(f"Error in GSM monitoring thread: {e}")
+            time.sleep(5)
+
+@app.route('/data', methods=['POST'])
+def receive_data():
+    try:
+        data = request.get_json()
+        if data and 'flow_rate' in data:
+            global current_flow_rate
+            current_flow_rate = data['flow_rate']
+            
+            new_valve_position = calculate_valve_position(current_flow_rate)
+            
+            update_firebase({
+                'flow_rate': current_flow_rate,
+                'valve_position': new_valve_position,
+                'timestamp': time.time()
+            })
+            
+            return jsonify({
+                'status': 'success',
+                'valve_position': new_valve_position
+            })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/status', methods=['GET'])
+def get_status():
+    return jsonify({
+        'flow_rate': current_flow_rate,
+        'valve_position': current_valve_position,
+        'last_update': last_firebase_update
+    })
+
+def main():
+    if not setup_gsm():
+        print("Failed to initialize GSM modem. Exiting...")
+        return
+    
+    gsm_thread = threading.Thread(target=gsm_monitoring_thread)
+    gsm_thread.daemon = True
+    gsm_thread.start()
+    
+    app.run(host='0.0.0.0', port=5000)
+
+if __name__ == '__main__':
+    main()
